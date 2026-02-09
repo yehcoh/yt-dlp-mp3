@@ -1,6 +1,5 @@
-# main.py
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse, JSONResponse
 import yt_dlp
 import os
 import time
@@ -8,55 +7,55 @@ from pathlib import Path
 
 app = FastAPI()
 
-# CORS - לאפשר גישה מכל מקור
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ספריית הורדה זמנית
+# תיקייה לשמירת MP3 זמניים
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# פונקציה לניקוי קבצים ישנים
-def cleanup_old_files(max_age_seconds=3600):
+# כמה שניות קבצים ישמרו (1 שעה)
+MAX_AGE = 3600  
+
+# מחיקת קבצים ישנים
+def cleanup_old_files():
     now = time.time()
-    for f in DOWNLOAD_DIR.iterdir():
-        if f.is_file() and (now - f.stat().st_mtime) > max_age_seconds:
-            f.unlink()
+    for file in DOWNLOAD_DIR.iterdir():
+        if file.is_file() and now - file.stat().st_mtime > MAX_AGE:
+            file.unlink()
 
 @app.get("/download")
-def download_mp3(url: str = Query(..., description="כתובת יוטיוב להורדה")):
-    cleanup_old_files()  # ניקוי קבצים ישנים
-
-    if not url.startswith("http"):
-        raise HTTPException(status_code=400, detail="כתובת לא חוקית")
+def download_mp3(url: str = Query(..., description="YouTube video URL")):
+    cleanup_old_files()  # מנקה קודם כל קבצים ישנים
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': str(DOWNLOAD_DIR / '%(id)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
+        'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
+        'cookies': 'cookies.txt',  # כאן העוגיות שלך
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
+        'quiet': True,
+        'no_warnings': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            filename = DOWNLOAD_DIR / f"{info_dict['id']}.mp3"
+            info = ydl.extract_info(url, download=True)
+            filename = DOWNLOAD_DIR / f"{info['title']}.mp3"
             if not filename.exists():
-                raise HTTPException(status_code=500, detail="MP3 לא נוצר")
-            # מחזיר URL ישיר
-            return {
-                "status": "ok",
-                "title": info_dict.get("title"),
-                "download_url": f"/downloads/{filename.name}"
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                return JSONResponse({"error": "MP3 not found after download"}, status_code=500)
+            
+            # מחזיר URL לשרת שלך (Render) שמוביל ישירות לקובץ
+            file_url = f"/stream/{filename.name}"
+            return {"title": info['title'], "url": file_url}
+
+    except yt_dlp.utils.DownloadError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+@app.get("/stream/{filename}")
+def stream_file(filename: str):
+    file_path = DOWNLOAD_DIR / filename
+    if file_path.exists():
+        return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
+    else:
+        return JSONResponse({"error": "File not found"}, status_code=404)
