@@ -7,14 +7,20 @@ from pathlib import Path
 
 app = FastAPI()
 
-# תיקייה לשמירת MP3 זמניים
+# תיקייה להורדות
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-# כמה שניות קבצים ישמרו (1 שעה)
 MAX_AGE = 3600  
 
-# מחיקת קבצים ישנים
+def setup_auth():
+    """יוצר קובץ עוגיות זמני ממשתנה הסביבה של Render"""
+    cookies_content = os.getenv("YT_COOKIES_DATA")
+    if cookies_content:
+        cookie_file = Path("cookies.txt")
+        cookie_file.write_text(cookies_content, encoding="utf-8")
+        return str(cookie_file)
+    return None
+
 def cleanup_old_files():
     now = time.time()
     for file in DOWNLOAD_DIR.iterdir():
@@ -23,12 +29,13 @@ def cleanup_old_files():
 
 @app.get("/download")
 def download_mp3(url: str = Query(..., description="YouTube video URL")):
-    cleanup_old_files()  # מנקה קודם כל קבצים ישנים
+    cleanup_old_files()
+    cookie_path = setup_auth()
 
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
-        'cookies': 'cookies.txt',  # כאן העוגיות שלך
+        'cookiefile': cookie_path, # שימוש בעוגיות שהכנו
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -36,20 +43,26 @@ def download_mp3(url: str = Query(..., description="YouTube video URL")):
         }],
         'quiet': True,
         'no_warnings': True,
+        # הוספת User-Agent כדי להיראות כמו דפדפן אמיתי
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = DOWNLOAD_DIR / f"{info['title']}.mp3"
-            if not filename.exists():
-                return JSONResponse({"error": "MP3 not found after download"}, status_code=500)
             
-            # מחזיר URL לשרת שלך (Render) שמוביל ישירות לקובץ
-            file_url = f"/stream/{filename.name}"
-            return {"title": info['title'], "url": file_url}
+            # איתור הקובץ הסופי (מטפל בתווים מיוחדים ש-yt-dlp מנקה)
+            actual_file = Path(ydl.prepare_filename(info)).with_suffix('.mp3')
+            
+            if not actual_file.exists():
+                return JSONResponse({"error": "File generation failed"}, status_code=500)
+            
+            return {
+                "title": info.get('title'),
+                "url": f"/stream/{actual_file.name}"
+            }
 
-    except yt_dlp.utils.DownloadError as e:
+    except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.get("/stream/{filename}")
@@ -57,5 +70,4 @@ def stream_file(filename: str):
     file_path = DOWNLOAD_DIR / filename
     if file_path.exists():
         return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
-    else:
-        return JSONResponse({"error": "File not found"}, status_code=404)
+    return JSONResponse({"error": "File not found"}, status_code=404)
