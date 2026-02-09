@@ -1,11 +1,13 @@
-from flask import Flask, request, jsonify, send_from_directory
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.responses import FileResponse
 import os
 import yt_dlp
 import uuid
 import threading
 import time
 
-app = Flask(__name__)
+app = FastAPI()
 
 # תיקייה זמנית לשמירת קבצים
 TMP_DIR = "/tmp/yt-dlp-mp3"
@@ -22,18 +24,17 @@ def cleanup_old_files():
                     os.remove(path)
                 except:
                     pass
-        time.sleep(3600)  # בדיקה כל שעה
+        time.sleep(3600)
 
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-# Endpoint API ל-GAS
-@app.route("/download", methods=["POST"])
-def download_mp3():
-    data = request.get_json()
-    if not data or "url" not in data:
-        return jsonify({"status":"error","message":"Missing URL"}), 400
+# מודל JSON לבקשת API
+class DownloadRequest(BaseModel):
+    url: str
 
-    yt_url = data["url"]
+@app.post("/download")
+async def download_mp3(req: DownloadRequest):
+    yt_url = req.url
     file_id = str(uuid.uuid4())
     output_path = os.path.join(TMP_DIR, f"{file_id}.%(ext)s")
 
@@ -55,16 +56,14 @@ def download_mp3():
             filename = ydl.prepare_filename(info).replace(".webm", ".mp3").replace(".m4a", ".mp3")
             title = info.get("title", "Unknown Title")
     except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # URL להורדה ישירה
-    mp3_url = f"{request.url_root}files/{os.path.basename(filename)}"
-    return jsonify({"status":"ok", "title": title, "mp3_url": mp3_url})
+    mp3_url = f"/files/{os.path.basename(filename)}"
+    return {"status": "ok", "title": title, "mp3_url": mp3_url}
 
-# Endpoint להורדת הקובץ
-@app.route("/files/<path:filename>", methods=["GET"])
-def serve_file(filename):
-    return send_from_directory(TMP_DIR, filename, as_attachment=True)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+@app.get("/files/{filename}")
+async def serve_file(filename: str):
+    path = os.path.join(TMP_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=filename)
