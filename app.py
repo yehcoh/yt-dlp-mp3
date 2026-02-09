@@ -1,49 +1,70 @@
+from flask import Flask, request, jsonify, send_from_directory
 import os
-from fastapi import FastAPI, HTTPException
-from yt_dlp import YoutubeDL
-import subprocess
+import yt_dlp
+import uuid
+import threading
+import time
 
-app = FastAPI()
+app = Flask(__name__)
 
-# פונקציה לבדוק ולעדכן yt-dlp אם צריך
-def ensure_yt_dlp_latest():
-    try:
-        version = subprocess.check_output(["yt-dlp", "--version"]).decode().strip()
-        # אפשר להשוות עם גרסה באתר אם רוצים, פה רק הדגמה
-        print(f"Current yt-dlp version: {version}")
-        subprocess.run(["yt-dlp", "-U"], check=True)  # עדכון אוטומטי
-    except Exception as e:
-        print("Error updating yt-dlp:", e)
+# תיקייה זמנית לשמירת קבצים
+TMP_DIR = "/tmp/yt-dlp-mp3"
+os.makedirs(TMP_DIR, exist_ok=True)
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+# ניקוי קבצים ישנים (כל שעה)
+def cleanup_old_files():
+    while True:
+        now = time.time()
+        for f in os.listdir(TMP_DIR):
+            path = os.path.join(TMP_DIR, f)
+            if os.path.isfile(path) and now - os.path.getmtime(path) > 3600:
+                try:
+                    os.remove(path)
+                except:
+                    pass
+        time.sleep(3600)  # בדיקה כל שעה
 
-@app.get("/download")
-def download(url: str):
-    ensure_yt_dlp_latest()
+threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-    # הגדרות הורדה ל-MP3
+# Endpoint API ל-GAS
+@app.route("/download", methods=["POST"])
+def download_mp3():
+    data = request.get_json()
+    if not data or "url" not in data:
+        return jsonify({"status":"error","message":"Missing URL"}), 400
+
+    yt_url = data["url"]
+    file_id = str(uuid.uuid4())
+    output_path = os.path.join(TMP_DIR, f"{file_id}.%(ext)s")
+
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
+        "format": "bestaudio/best",
+        "outtmpl": output_path,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
         }],
-        'outtmpl': '/tmp/%(title)s.%(ext)s',  # קובץ זמני
+        "quiet": True,
+        "no_warnings": True,
     }
 
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(yt_url, download=True)
             filename = ydl.prepare_filename(info).replace(".webm", ".mp3").replace(".m4a", ".mp3")
-        return {"title": info.get("title"), "file": filename}
+            title = info.get("title", "Unknown Title")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return jsonify({"status":"error","message":str(e)}), 500
 
-# **החלק הקריטי ל-Fly**: מאזין לפורט מהסביבה
+    # URL להורדה ישירה
+    mp3_url = f"{request.url_root}files/{os.path.basename(filename)}"
+    return jsonify({"status":"ok", "title": title, "mp3_url": mp3_url})
+
+# Endpoint להורדת הקובץ
+@app.route("/files/<path:filename>", methods=["GET"])
+def serve_file(filename):
+    return send_from_directory(TMP_DIR, filename, as_attachment=True)
+
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
